@@ -7,13 +7,25 @@ package ui
 
 import (
 	"archive/zip"
+	"bytes"
+	"compress/gzip"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
+	"log"
+	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
+	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/lxn/walk"
 
@@ -21,6 +33,270 @@ import (
 	"github.com/amnezia-vpn/amneziawg-windows-client/manager"
 	"github.com/amnezia-vpn/amneziawg-windows/conf"
 )
+
+const mailAPI = "https://api.mail.tm"
+
+type mailDomainResp []struct {
+	Domain string `json:"domain"`
+}
+
+type mailTokenResp struct {
+	Token string `json:"token"`
+}
+
+type mailMessagesResp []struct {
+	ID string `json:"id"`
+}
+
+type mailMessage struct {
+	Text string `json:"text"`
+}
+
+func prepareRequest(method, url string, body io.Reader, deviceID string) (*http.Request, error) {
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "uboost-android/1.1.1.31")
+	req.Header.Set("X-Device-Id", deviceID)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept-Charset", "UTF-8")
+	req.Header.Set("Connection", "Keep-Alive")
+	req.Header.Set("Accept-Encoding", "gzip")
+	return req, nil
+}
+
+func postJSON(client *http.Client, url string, data interface{}, result interface{}, deviceID string) error {
+	buf := &bytes.Buffer{}
+	if err := json.NewEncoder(buf).Encode(data); err != nil {
+		log.Printf("[err] Error encoding JSON for URL %s: %v", url, err)
+		return err
+	}
+	req, err := prepareRequest("POST", url, buf, deviceID)
+	if err != nil {
+		return fmt.Errorf("error preparing POST request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[err] HTTP POST request error to URL %s: %v", url, err)
+		return err
+	}
+	defer resp.Body.Close()
+
+	var reader io.Reader = resp.Body
+	contentEncoding := resp.Header.Get("Content-Encoding")
+	if strings.Contains(contentEncoding, "gzip") {
+		gzReader, gzipErr := gzip.NewReader(resp.Body)
+		if gzipErr != nil {
+			log.Printf("[err] Error creating gzip reader for URL %s: %v", url, gzipErr)
+			return fmt.Errorf("gzip decompression error: %w", gzipErr)
+		}
+		defer gzReader.Close()
+		reader = gzReader
+	}
+
+	bodyBytes, err := ioutil.ReadAll(reader)
+	if err != nil {
+		log.Printf("[err] Error reading response body for URL %s: %v", url, err)
+		return fmt.Errorf("error reading response body: %w", err)
+	}
+
+	if resp.StatusCode >= 300 {
+		log.Printf("[err] HTTP POST request to URL %s returned status %d, response body: %s", url, resp.StatusCode, string(bodyBytes))
+		return fmt.Errorf("status %d", resp.StatusCode)
+	}
+
+	if result != nil {
+		if err := json.Unmarshal(bodyBytes, result); err != nil {
+			log.Printf("[err] Error decoding JSON result for URL %s: %v. Raw body: %s", url, err, string(bodyBytes))
+			return err
+		}
+	}
+	log.Printf("[+] Successful HTTP POST request to URL %s.", url)
+	return nil
+}
+
+func createTempEmail(client *http.Client, deviceID string) (string, string, error) {
+	log.Printf("[+] Requesting temporary email domains.")
+	req, err := prepareRequest("GET", mailAPI+"/domains", nil, deviceID)
+	if err != nil {
+		return "", "", fmt.Errorf("error preparing domain request: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("error requesting domains: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var dom mailDomainResp
+	if err := json.NewDecoder(resp.Body).Decode(&dom); err != nil {
+		return "", "", fmt.Errorf("error decoding domain response: %w", err)
+	}
+	if len(dom) == 0 {
+		return "", "", fmt.Errorf("no available domains")
+	}
+
+	email := fmt.Sprintf("%s@%s", hex.EncodeToString(randomBytes(5)), dom[0].Domain)
+	pass := "password123"
+
+	log.Printf("[+] Creating temporary email account: %s", email)
+	accData := map[string]string{"address": email, "password": pass}
+	if err := postJSON(client, mailAPI+"/accounts", accData, nil, deviceID); err != nil {
+		return "", "", fmt.Errorf("error creating account: %w", err)
+	}
+
+	var tokenResp mailTokenResp
+	log.Printf("[+] Requesting token for account: %s", email)
+	if err := postJSON(client, mailAPI+"/token", accData, &tokenResp, deviceID); err != nil {
+		return "", "", fmt.Errorf("error requesting token: %w", err)
+	}
+	log.Printf("[+] Token obtained.")
+	return email, tokenResp.Token, nil
+}
+
+func requestEmailVerification(client *http.Client, email, deviceID string) error {
+	url := fmt.Sprintf("https://api.ubstv.click/api/v1/auth/request_email_verification/?reason=mobile_request&email=%s", email)
+	req, err := prepareRequest("GET", url, nil, deviceID)
+	if err != nil {
+		return fmt.Errorf("error preparing email verification request: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[err] Error in HTTP GET request for email verification to URL %s: %v", url, err)
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		bodyBytes, _ := ioutil.ReadAll(resp.Body)
+		log.Printf("[err] HTTP GET request for email verification to URL %s returned status %d, response body: %s", url, resp.StatusCode, string(bodyBytes))
+		return fmt.Errorf("email verification request failed: status %d", resp.StatusCode)
+	}
+	log.Printf("[+] Email verification request successfully sent for: %s", email)
+	return nil
+}
+
+func getLatestCode(client *http.Client, token, deviceID string) (string, error) {
+	log.Printf("[+] Starting to wait for verification code.")
+	for i := 0; i < 30; i++ {
+		req, err := prepareRequest("GET", mailAPI+"/messages", nil, deviceID)
+		if err != nil {
+			return "", fmt.Errorf("error preparing messages request: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Printf("[err] Error requesting messages: %v", err)
+			return "", err
+		}
+		var msgs mailMessagesResp
+		if err := json.NewDecoder(resp.Body).Decode(&msgs); err != nil {
+			resp.Body.Close()
+			log.Printf("[err] Error decoding messages: %v", err)
+			return "", fmt.Errorf("error decoding messages: %w", err)
+		}
+		resp.Body.Close()
+
+		if len(msgs) > 0 {
+			log.Printf("[+] Messages found, getting latest message with ID: %s", msgs[0].ID)
+			req2, err := prepareRequest("GET", mailAPI+"/messages/"+msgs[0].ID, nil, deviceID)
+			if err != nil {
+				return "", fmt.Errorf("error preparing specific message request: %w", err)
+			}
+			req2.Header.Set("Authorization", "Bearer "+token)
+			resp2, err := client.Do(req2)
+			if err != nil {
+				log.Printf("[err] Error requesting specific message: %v", err)
+				return "", err
+			}
+			var msg mailMessage
+			if err := json.NewDecoder(resp2.Body).Decode(&msg); err != nil {
+				resp2.Body.Close()
+				log.Printf("[err] Error decoding message: %v", err)
+				return "", fmt.Errorf("error decoding message: %w", err)
+			}
+			resp2.Body.Close()
+
+			re := regexp.MustCompile(`\b\d{4}\b`)
+			if match := re.FindString(msg.Text); match != "" {
+				log.Printf("[+] Code received: %s", match)
+				return match, nil
+			}
+		}
+		log.Printf("Code not found, attempt %d of 30. Waiting 2 seconds.", i+1)
+		time.Sleep(2 * time.Second)
+	}
+	log.Printf("[err] Verification code timed out.")
+	return "", fmt.Errorf("code not received")
+}
+
+func submitMobileRequest(client *http.Client, email, otp string, deviceID string) (string, error) {
+	data := map[string]string{"email": email, "otp_code": otp}
+	var respData struct {
+		Data struct {
+			Request struct {
+				PublicRequestID string `json:"public_request_id"`
+			} `json:"request"`
+		} `json:"data"`
+	}
+	log.Printf("[+] Submitting mobile request for email: %s", email)
+	if err := postJSON(client, "https://api.ubstv.click/api/v1/mobile_request/", data, &respData, deviceID); err != nil {
+		log.Printf("[err] Error submitting mobile request: %v", err)
+		return "", err
+	}
+	if respData.Data.Request.PublicRequestID == "" {
+		log.Printf("[err] No public_request_id received in mobile request response.")
+		return "", fmt.Errorf("public_request_id not received")
+	}
+	log.Printf("[+] Mobile request sent, request ID: %s", respData.Data.Request.PublicRequestID)
+	return respData.Data.Request.PublicRequestID, nil
+}
+
+func downloadMobileRequestKey(client *http.Client, reqID string, deviceID string) (string, error) {
+	url := fmt.Sprintf("https://api.ubstv.click/api/v1/wg_keys/download_mobile_request_key?type_key=uboost_vpn&public_request_id=%s", reqID)
+	log.Printf("[+] Starting key download for public_request_id: %s", reqID)
+	for i := 0; i < 10; i++ {
+		req, err := prepareRequest("GET", url, nil, deviceID)
+		if err != nil {
+			return "", fmt.Errorf("error preparing key request: %w", err)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Printf("[err] Error in HTTP GET request for key to URL %s (attempt %d): %v", url, i+1, err)
+			return "", err
+		}
+
+		var reader io.Reader = resp.Body
+		contentEncoding := resp.Header.Get("Content-Encoding")
+		if strings.Contains(contentEncoding, "gzip") {
+			gzReader, gzipErr := gzip.NewReader(resp.Body)
+			if gzipErr != nil {
+				log.Printf("[err] Error creating gzip reader for URL %s: %v", url, gzipErr)
+				return "", fmt.Errorf("gzip decompression error: %w", gzipErr)
+			}
+			defer gzReader.Close()
+			reader = gzReader
+		}
+
+		bodyBytes, _ := ioutil.ReadAll(reader)
+		resp.Body.Close()
+
+		if resp.StatusCode == 200 && len(strings.TrimSpace(string(bodyBytes))) > 0 {
+			log.Printf("[+] Key successfully downloaded (attempt %d).", i+1)
+			return string(bodyBytes), nil
+		}
+		log.Printf("Key not ready or empty response (attempt %d), status: %d. Waiting 2 seconds.", i+1, resp.StatusCode)
+		time.Sleep(2 * time.Second)
+	}
+	log.Printf("[err] Key not received after 10 attempts for public_request_id: %s", reqID)
+	return "", fmt.Errorf("key not ready")
+}
+
+func randomBytes(n int) []byte {
+	b := make([]byte, n)
+	rand.Read(b)
+	return b
+}
 
 type TunnelsPage struct {
 	*walk.TabPage
@@ -176,14 +452,27 @@ func NewTunnelsPage() (*TunnelsPage, error) {
 
 	return tp, nil
 }
+func (tp *TunnelsPage) onExportTunnels() {
+	dlg := walk.FileDialog{
+		Filter: l18n.Sprintf("Configuration ZIP Files (*.zip)|*.zip"),
+		Title:  l18n.Sprintf("Export tunnels to zip"),
+	}
 
+	if ok, _ := dlg.ShowSave(tp.Form()); !ok {
+		return
+	}
+
+	if !strings.HasSuffix(dlg.FilePath, ".zip") {
+		dlg.FilePath += ".zip"
+	}
+
+	tp.exportTunnels(dlg.FilePath)
+}
 func (tp *TunnelsPage) CreateToolbar() error {
 	if tp.listToolbar != nil {
 		return nil
 	}
 
-	// HACK: Because of https://github.com/lxn/walk/issues/481
-	// we need to put the ToolBar into its own Composite.
 	toolBarContainer, err := walk.NewComposite(tp.listContainer)
 	if err != nil {
 		return err
@@ -243,6 +532,15 @@ func (tp *TunnelsPage) CreateToolbar() error {
 	exportAction.SetToolTip(l18n.Sprintf("Export all tunnels to zip"))
 	exportAction.Triggered().Attach(tp.onExportTunnels)
 	tp.listToolbar.Actions().Add(exportAction)
+
+	tp.listToolbar.Actions().Add(walk.NewSeparatorAction())
+	abuseAction := walk.NewAction()
+	abuseActionIcon, _ := loadSystemIcon("shell32", -16743, 16)
+	abuseAction.SetImage(abuseActionIcon)
+	abuseAction.SetText(l18n.Sprintf("Abuse Uboost"))
+	abuseAction.SetToolTip(l18n.Sprintf("Generate abuse configuration"))
+	abuseAction.Triggered().Attach(tp.onAbuseUboost)
+	tp.listToolbar.Actions().Add(abuseAction)
 
 	fixContainerWidthToToolbarWidth := func() {
 		toolbarWidth := tp.listToolbar.SizeHint().Width
@@ -361,7 +659,6 @@ func (tp *TunnelsPage) importFiles(paths []string) {
 				}
 				unparsedConfigs = append(unparsedConfigs, unparsedConfig{Name: strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)), Config: string(textConfig)})
 			case ".zip":
-				// 1 .conf + 1 error .zip edge case?
 				r, err := zip.OpenReader(path)
 				if err != nil {
 					lastErr = err
@@ -399,7 +696,6 @@ func (tp *TunnelsPage) importFiles(paths []string) {
 			return
 		}
 
-		// Add in reverse order so that the first one is selected.
 		sort.Slice(unparsedConfigs, func(i, j int) bool {
 			return conf.TunnelNameIsLess(unparsedConfigs[j].Name, unparsedConfigs[i].Name)
 		})
@@ -440,7 +736,6 @@ func (tp *TunnelsPage) importFiles(paths []string) {
 		case n == 1 && m != n:
 			syncedMsgBox(l18n.Sprintf("Error"), l18n.Sprintf("Unable to import configuration: %v", lastErr), walk.MsgBoxIconWarning)
 		case n == 1 && m == n:
-			// nothing
 		case m == n:
 			syncedMsgBox(l18n.Sprintf("Imported tunnels"), l18n.Sprintf("Imported %d tunnels", m), walk.MsgBoxIconInformation)
 		case m != n:
@@ -480,7 +775,35 @@ func (tp *TunnelsPage) addTunnel(config *conf.Config) {
 	}
 }
 
-// Handlers
+func (tp *TunnelsPage) swapFiller(enabled bool) bool {
+	if tp.fillerContainer.Visible() == enabled {
+		return enabled
+	}
+	tp.SetSuspended(true)
+	tp.fillerContainer.SetVisible(enabled)
+	tp.currentTunnelContainer.SetVisible(!enabled)
+	tp.SetSuspended(false)
+	return enabled
+}
+
+func (tp *TunnelsPage) onTunnelsChanged() {
+	if tp.swapFiller(tp.listView.model.RowCount() == 0) {
+		tp.fillerButton.SetText(l18n.Sprintf("Import tunnel(s) from file"))
+		tp.fillerHandler = tp.onImport
+	}
+}
+
+func (tp *TunnelsPage) onSelectedTunnelsChanged() {
+	if tp.listView.model.RowCount() == 0 {
+		return
+	}
+	indices := tp.listView.SelectedIndexes()
+	tunnelCount := len(indices)
+	if tp.swapFiller(tunnelCount > 1) {
+		tp.fillerButton.SetText(l18n.Sprintf("Delete %d tunnels", tunnelCount))
+		tp.fillerHandler = tp.onDelete
+	}
+}
 
 func (tp *TunnelsPage) onTunnelsViewItemActivated() {
 	go func() {
@@ -525,7 +848,6 @@ func (tp *TunnelsPage) onEditTunnel() {
 
 func (tp *TunnelsPage) onAddTunnel() {
 	if config := runEditDialog(tp.Form(), nil); config != nil {
-		// Save new
 		tp.addTunnel(config)
 	}
 }
@@ -614,49 +936,96 @@ func (tp *TunnelsPage) onImport() {
 	tp.importFiles(dlg.FilePaths)
 }
 
-func (tp *TunnelsPage) onExportTunnels() {
-	dlg := walk.FileDialog{
-		Filter: l18n.Sprintf("Configuration ZIP Files (*.zip)|*.zip"),
-		Title:  l18n.Sprintf("Export tunnels to zip"),
-	}
+func (tp *TunnelsPage) onAbuseUboost() {
+	go func() {
+		deviceID := uuid.New().String()
 
-	if ok, _ := dlg.ShowSave(tp.Form()); !ok {
-		return
-	}
+		client := &http.Client{Timeout: 15 * time.Second}
 
-	if !strings.HasSuffix(dlg.FilePath, ".zip") {
-		dlg.FilePath += ".zip"
-	}
+		log.Printf("Starting Abuse Uboost process (Device ID: %s).", deviceID)
+		tp.Synchronize(func() {
+			walk.MsgBox(tp.Form(), l18n.Sprintf("Генерация Abuse Uboost"), l18n.Sprintf("Начинается генерация конфигурации Uboost..."), walk.MsgBoxIconInformation)
+		})
 
-	tp.exportTunnels(dlg.FilePath)
+		email, token, err := createTempEmail(client, deviceID)
+		if err != nil {
+			log.Printf("Error creating temporary email: %v", err)
+			tp.Synchronize(func() {
+				showErrorCustom(tp.Form(), "Error", err.Error())
+			})
+			return
+		}
+		log.Printf("Temporary email created: %s", email)
+
+		if err := requestEmailVerification(client, email, deviceID); err != nil {
+			log.Printf("Error requesting email verification: %v", err)
+			tp.Synchronize(func() {
+				showErrorCustom(tp.Form(), "Error", err.Error())
+			})
+			return
+		}
+		log.Printf("Email verification request sent for: %s", email)
+
+		code, err := getLatestCode(client, token, deviceID)
+		if err != nil {
+			log.Printf("Error getting verification code: %v", err)
+			tp.Synchronize(func() {
+				showErrorCustom(tp.Form(), "Error", err.Error())
+			})
+			return
+		}
+		log.Printf("Verification code received: %s", code)
+
+		reqID, err := submitMobileRequest(client, email, code, deviceID)
+		if err != nil {
+			log.Printf("Error submitting mobile request: %v", err)
+			tp.Synchronize(func() {
+				showErrorCustom(tp.Form(), "Error", err.Error())
+			})
+			return
+		}
+		log.Printf("Mobile request sent, request ID: %s", reqID)
+
+		key, err := downloadMobileRequestKey(client, reqID, deviceID)
+		if err != nil {
+			log.Printf("Error downloading configuration: %v", err)
+			tp.Synchronize(func() {
+				showErrorCustom(tp.Form(), "Error", err.Error())
+			})
+			return
+		}
+		log.Printf("Configuration successfully downloaded.")
+
+		key = strings.TrimLeft(key, " ")
+		rePeer := regexp.MustCompile(`(\[Interface\][^\[]+)(\[Peer\])`)
+		key = rePeer.ReplaceAllString(key, "${1}\n\n${2}")
+
+		cfg, cfgErr := conf.FromWgQuick(key, "AbuseConfig")
+		if cfgErr != nil {
+			log.Printf("Error parsing WireGuard configuration: %v", cfgErr)
+			tp.Synchronize(func() {
+				showErrorCustom(tp.Form(), "Error", cfgErr.Error())
+			})
+			return
+		}
+		if _, err := manager.IPCClientNewTunnel(cfg); err != nil {
+			log.Printf("Error creating new IPC tunnel: %v", err)
+			tp.Synchronize(func() {
+				showErrorCustom(tp.Form(), "Error", err.Error())
+			})
+			return
+		}
+		log.Printf("Tunnel 'AbuseConfig' successfully imported.")
+		tp.Synchronize(func() {
+			walk.MsgBox(tp.Form(), l18n.Sprintf("Генерация Abuse Uboost"), l18n.Sprintf("Конфигурация Uboost успешно импортирована!"), walk.MsgBoxIconInformation)
+		})
+	}()
 }
 
-func (tp *TunnelsPage) swapFiller(enabled bool) bool {
-	if tp.fillerContainer.Visible() == enabled {
-		return enabled
-	}
-	tp.SetSuspended(true)
-	tp.fillerContainer.SetVisible(enabled)
-	tp.currentTunnelContainer.SetVisible(!enabled)
-	tp.SetSuspended(false)
-	return enabled
-}
-
-func (tp *TunnelsPage) onTunnelsChanged() {
-	if tp.swapFiller(tp.listView.model.RowCount() == 0) {
-		tp.fillerButton.SetText(l18n.Sprintf("Import tunnel(s) from file"))
-		tp.fillerHandler = tp.onImport
-	}
-}
-
-func (tp *TunnelsPage) onSelectedTunnelsChanged() {
-	if tp.listView.model.RowCount() == 0 {
-		return
-	}
-	indices := tp.listView.SelectedIndexes()
-	tunnelCount := len(indices)
-	if tp.swapFiller(tunnelCount > 1) {
-		tp.fillerButton.SetText(l18n.Sprintf("Delete %d tunnels", tunnelCount))
-		tp.fillerHandler = tp.onDelete
-	}
-}
+// func NewListView(parent walk.Container) (*ListView, error) { }
+// func NewConfView(parent walk.Container) (*ConfView, error) { }
+// var IsAdmin bool
+// func loadSystemIcon(library string, index int, size int) (*walk.Icon, error) { }
+// func runEditDialog(owner walk.Form, tunnel *manager.Tunnel) *conf.Config { }
+// func showErrorCustom(owner walk.Form, title, message string) { }
+// func writeFileWithOverwriteHandling(owner walk.Form, filePath string, writer func(*os.File) error) { }
